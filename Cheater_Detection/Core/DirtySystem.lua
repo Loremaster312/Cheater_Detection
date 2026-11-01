@@ -16,6 +16,9 @@
 
 local Constants = require("Cheater_Detection.Core.constants")
 
+local next  = next
+local pairs = pairs
+
 local DirtySystem = {}
 
 -- Valid dirty reasons (string keys for clarity)
@@ -31,12 +34,39 @@ DirtySystem.REASONS = {
 
 -- Single table: [playerID] = {reason1=true, reason2=true, ...}
 local dirtyPlayers = {}
+local dirtyPlayerCount = 0
+
+-- Object pool for per-player reason tables to eliminate GC churn
+local entryPool = {}
+local entryPoolCount = 0
+
+-- Scratch buffer for re-entrancy-safe ProcessDirty execution
+local processBuffer = {}
 
 -- Stats
 local stats = {
     marksTotal = 0,
     processesTotal = 0,
 }
+
+local function acquireEntry()
+    if entryPoolCount > 0 then
+        local entry = entryPool[entryPoolCount]
+        entryPool[entryPoolCount] = nil
+        entryPoolCount = entryPoolCount - 1
+        return entry
+    end
+    return {}
+end
+
+local function releaseEntry(playerID, entry)
+    dirtyPlayers[playerID] = nil
+    dirtyPlayerCount = dirtyPlayerCount - 1
+    if entryPoolCount < 128 then
+        entryPoolCount = entryPoolCount + 1
+        entryPool[entryPoolCount] = entry
+    end
+end
 
 --- Mark a player as dirty with specific reason
 ---@param playerID string Player's SteamID64
@@ -48,8 +78,9 @@ function DirtySystem.MarkDirty(playerID, reason)
 
     local playerEntry = dirtyPlayers[playerID]
     if not playerEntry then
-        playerEntry = {}
+        playerEntry = acquireEntry()
         dirtyPlayers[playerID] = playerEntry
+        dirtyPlayerCount = dirtyPlayerCount + 1
     end
 
     if not playerEntry[reason] then
@@ -58,40 +89,49 @@ function DirtySystem.MarkDirty(playerID, reason)
     end
 end
 
---- Process dirty players for specific reason
+--- Process dirty players for specific reason (safe against re-entrant MarkDirty/ClearDirty inside callback)
 ---@param reason string One of DirtySystem.REASONS to process
 ---@param callback function Called for each dirty player: callback(playerID)
 function DirtySystem.ProcessDirty(reason, callback)
-    if not reason or not callback then
+    if not reason or not callback or dirtyPlayerCount == 0 then
         return 0
     end
 
-    local processedCount = 0
+    local count = 0
 
     for playerID, reasons in pairs(dirtyPlayers) do
         if reasons[reason] then
-            callback(playerID)
-            processedCount = processedCount + 1
+            count = count + 1
+            processBuffer[count] = playerID
 
-            -- Clear this reason
+            -- Clear this reason before running callback so re-entrant marks are preserved
             reasons[reason] = nil
 
-            -- If no more reasons, remove player entry entirely
+            -- If no more reasons, recycle player entry
             if not next(reasons) then
-                dirtyPlayers[playerID] = nil
+                releaseEntry(playerID, reasons)
             end
         end
     end
 
-    stats.processesTotal = stats.processesTotal + processedCount
-    return processedCount
+    for i = 1, count do
+        local playerID = processBuffer[i]
+        processBuffer[i] = nil
+        callback(playerID)
+    end
+
+    stats.processesTotal = stats.processesTotal + count
+    return count
 end
 
 --- Check if a player has specific dirty reason
 ---@param playerID string Player's SteamID64
----@param reason string One of DirtySystem.REASONS
+---@param reason string? One of DirtySystem.REASONS
 ---@return boolean True if player has this reason dirty
 function DirtySystem.IsDirty(playerID, reason)
+    if not playerID then
+        return false
+    end
     local playerEntry = dirtyPlayers[playerID]
     if not playerEntry then
         return false
@@ -106,21 +146,32 @@ end
 ---@param playerID string Player's SteamID64
 ---@return table|nil Table of reasons {score=true, flags=true} or nil
 function DirtySystem.GetDirtyReasons(playerID)
+    if not playerID then
+        return nil
+    end
     return dirtyPlayers[playerID]
 end
 
 --- Get all player IDs with specific dirty reason
 ---@param reason string One of DirtySystem.REASONS
+---@param outTable table? Optional pre-allocated array to populate
 ---@return table Array of player IDs
-function DirtySystem.GetDirtyPlayers(reason)
-    local players = {}
-    if not reason then
+function DirtySystem.GetDirtyPlayers(reason, outTable)
+    local players = outTable or {}
+    if outTable then
+        for i = 1, #players do
+            players[i] = nil
+        end
+    end
+    if not reason or dirtyPlayerCount == 0 then
         return players
     end
 
+    local n = 0
     for playerID, reasons in pairs(dirtyPlayers) do
         if reasons[reason] then
-            players[#players + 1] = playerID
+            n = n + 1
+            players[n] = playerID
         end
     end
 
@@ -131,28 +182,38 @@ end
 ---@param playerID string Player's SteamID64
 ---@param reason string|nil Specific reason to clear (nil = clear all)
 function DirtySystem.ClearDirty(playerID, reason)
+    if not playerID then
+        return
+    end
     local playerEntry = dirtyPlayers[playerID]
     if not playerEntry then
         return
     end
 
     if not reason then
-        -- Clear all
-        dirtyPlayers[playerID] = nil
-    else
+        -- Clear all and recycle table
+        for k in pairs(playerEntry) do
+            playerEntry[k] = nil
+        end
+        releaseEntry(playerID, playerEntry)
+    elseif playerEntry[reason] then
         -- Clear specific reason
         playerEntry[reason] = nil
         if not next(playerEntry) then
-            dirtyPlayers[playerID] = nil
+            releaseEntry(playerID, playerEntry)
         end
     end
 end
 
 --- Clear all dirty data
 function DirtySystem.ClearAll()
-    for k in pairs(dirtyPlayers) do
-        dirtyPlayers[k] = nil
+    for playerID, entry in pairs(dirtyPlayers) do
+        for k in pairs(entry) do
+            entry[k] = nil
+        end
+        releaseEntry(playerID, entry)
     end
+    dirtyPlayerCount = 0
     stats.marksTotal = 0
     stats.processesTotal = 0
 end
@@ -160,15 +221,10 @@ end
 --- Get statistics
 ---@return table Statistics
 function DirtySystem.GetStats()
-    local dirtyCount = 0
-    for _ in pairs(dirtyPlayers) do
-        dirtyCount = dirtyCount + 1
-    end
-
     return {
         marksTotal = stats.marksTotal,
         processesTotal = stats.processesTotal,
-        dirtyPlayerCount = dirtyCount,
+        dirtyPlayerCount = dirtyPlayerCount,
     }
 end
 
