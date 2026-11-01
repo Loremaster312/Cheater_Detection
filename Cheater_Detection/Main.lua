@@ -50,6 +50,9 @@ if not _profilerOk then
 	Profiler = { Begin = function() end, End = function() end, SetVisible = function() end, SetContext = function() end, Draw = function() end }
 end
 
+local profBegin           = Profiler.Begin
+local profEnd             = Profiler.End
+
 -- Actions
 local NotificationService = require("Cheater_Detection.services.notification_service")
 local Visuals             = require("Cheater_Detection.actions.visuals")
@@ -145,7 +148,8 @@ local function persistActiveSessionPlayers()
 	-- Use DirtySystem - only persist players with dirty SESSION flag
 	local dirtyPlayers = DirtySystem.GetDirtyPlayers("session")
 
-	for _, id in ipairs(dirtyPlayers) do
+	for i = 1, #dirtyPlayers do
+		local id = dirtyPlayers[i]
 		local state = PlayerCache.GetByID(id)
 		if state then
 			persistSessionPlayerState(id, state, nil)
@@ -269,14 +273,13 @@ local function OnCreateMove(cmd)
 		Profiler.SetContext("tick")
 	end
 
-	Profiler.Begin("Scheduler_Tick")
+	profBegin("Scheduler_Tick")
 	Scheduler.Tick()
-	Profiler.End("Scheduler_Tick")
+	profEnd("Scheduler_Tick")
 
-	Profiler.Begin("CreateMove_Total")
-	local isGameUI = engine.IsGameUIVisible()
-	if isGameUI then
-		Profiler.End("CreateMove_Total")
+	profBegin("CreateMove_Total")
+	if engine.IsGameUIVisible() then
+		profEnd("CreateMove_Total")
 		return
 	end
 
@@ -292,36 +295,37 @@ local function OnCreateMove(cmd)
 			sessionState.groupSearched = false
 			sessionState.valveDisconnectTriggered = false
 		end
-		Profiler.End("CreateMove_Total")
+		profEnd("CreateMove_Total")
 		return
 	end
 	sessionState.inServer = true
 
 	local localPlayer = entities.GetLocalPlayer()
 	if not localPlayer or not localPlayer:IsValid() then
-		Profiler.End("CreateMove_Total")
+		profEnd("CreateMove_Total")
 		return
 	end
 
 	tryPurgeLocalAfterFetch()
 
 	if sessionState.valveDisconnectTriggered then
-		Profiler.End("CreateMove_Total")
+		profEnd("CreateMove_Total")
 		return
 	end
 
-	Profiler.Begin("CreateMove_Events")
+	profBegin("CreateMove_Events")
 	Events.DispatchEngineEvent("CreateMove", cmd)
-	Profiler.End("CreateMove_Events")
+	profEnd("CreateMove_Events")
 
-	Profiler.Begin("CreateMove_Prep")
+	profBegin("CreateMove_Prep")
 	local menu             = G.Menu
-	local adv              = menu.Advanced
+	local adv              = menu and menu.Advanced or {}
+	local mainCfg          = menu and menu.Main or {}
 
-	local enableValveCheck = menu.Main.ValveCheck == true
-	-- Silent aim / aimlock disabled pending rework; menu toggles ignored until restored.
-	local enableSilent     = false
-	local enableAimLock    = false
+	local enableValveCheck = mainCfg.ValveCheck == true
+	-- Silent aim / aimlock driven by menu toggles.
+	local enableSilent     = adv.SilentAimbot == true
+	local enableAimLock    = adv.AimLock == true
 	local enableAntiAim    = adv.AntiAim == true
 	local enableDuckSpeed  = adv.DuckSpeed == true
 	local enableBhop       = adv.Bhop == true
@@ -329,10 +333,10 @@ local function OnCreateMove(cmd)
 	local enableChoke      = adv.Choke == true
 	local enableCosmetics  = adv.Cosmetics == true
 
-	if not (enableValveCheck or enableSilent or enableAntiAim or enableDuckSpeed
+	if not (enableValveCheck or enableSilent or enableAimLock or enableAntiAim or enableDuckSpeed
 			or enableBhop or enableDoubleTap or enableChoke or enableCosmetics) then
-		Profiler.End("CreateMove_Prep")
-		Profiler.End("CreateMove_Total")
+		profEnd("CreateMove_Prep")
+		profEnd("CreateMove_Total")
 		return
 	end
 
@@ -363,43 +367,45 @@ local function OnCreateMove(cmd)
 		sessionState.groupSearched = false
 		SteamLookup.StopGroupFetch()
 	end
-	Profiler.End("CreateMove_Prep")
+	profEnd("CreateMove_Prep")
 	-- TickGroupFetch is paced in Scheduler.Tick, not the CreateMove hot path.
 
 	-- Sync authoritative live-player list and tick entity cache once per tick
-	Profiler.Begin("PlayerCache_Sync")
-	-- DEBUG: skip SyncTick entirely to measure baseline FPS
-	-- if false then
+	profBegin("PlayerCache_Sync")
 	PlayerCache.SyncTick()
-	-- end
-	Profiler.End("PlayerCache_Sync")
+	profEnd("PlayerCache_Sync")
 
 	-- Skip all detector work on frames where the game tick hasn't advanced
 	-- (CreateMove fires per frame, game ticks at 66 Hz)
 	local curTick = globals.TickCount()
 	if curTick == lastDetectorTick then
-		Profiler.End("CreateMove_Total")
+		profEnd("CreateMove_Total")
 		return
 	end
 	lastDetectorTick = curTick
 
-	Profiler.Begin("Evidence_Decay")
+	profBegin("Evidence_Decay")
 	Evidence.ApplyDecay()
-	Profiler.End("Evidence_Decay")
+	profEnd("Evidence_Decay")
 
 	if enableValveCheck then
-		Profiler.Begin("ValveCheck_Deferred")
+		profBegin("ValveCheck_Deferred")
 		ValveCheck.Tick()
-		Profiler.End("ValveCheck_Deferred")
+		profEnd("ValveCheck_Deferred")
 	end
 
 	local isDebug = isDebugEnabled()
-	local localID = tostring(Common.GetSteamID64(localPlayer) or "")
+	local localID = PlayerCache.GetLocalID()
+	if not localID or localID == "" then
+		localID = tostring(Common.GetSteamID64(localPlayer) or "")
+	end
 	local stateTable = PlayerCache.GetActiveTable()
 
 	-- Pre-filter active players into a flat list (reuse module-level table)
-	Profiler.Begin("PlayerScan_BuildActive")
+	profBegin("PlayerScan_BuildActive")
 	for k = 1, #activePlayers do activePlayers[k] = nil end
+	local numActive = 0
+
 	for id, existingState in pairs(stateTable) do
 		local pdata = existingState.pdata
 		if not pdata then goto continue end
@@ -435,46 +441,49 @@ local function OnCreateMove(cmd)
 			end
 		end
 
-		activePlayers[#activePlayers + 1] = existingState
+		numActive = numActive + 1
+		activePlayers[numActive] = existingState
 		::continue::
 	end
-	Profiler.End("PlayerScan_BuildActive")
+	profEnd("PlayerScan_BuildActive")
 
 	if enableSilent then
-		Profiler.Begin("History_SilentAim")
+		profBegin("History_SilentAim")
 		SilentAim.RecordTickHistory()
-		Profiler.End("History_SilentAim")
+		profEnd("History_SilentAim")
 	end
 
 	-- Simtime + tick gaps stored once per player per tick (FakeLag/DoubleTap read only).
 	if enableChoke or enableDoubleTap then
-		Profiler.Begin("History_Simtime")
-		for _, pState in ipairs(activePlayers) do
+		profBegin("History_Simtime")
+		for i = 1, numActive do
+			local pState = activePlayers[i]
 			HistoryManager.RecordSimtimeTick(pState.id, pState.pdata.simTime)
 		end
-		Profiler.End("History_Simtime")
+		profEnd("History_Simtime")
 	end
 
 	-- ValveCheck runs via scheduler + DirtySystem "checks" (once per player per map)
 	-- Auto-disconnect enforcement still runs every tick for confirmed Valve employees
 	if enableValveCheck then
-		Profiler.Begin("ValveCheck")
-		for _, pState in ipairs(activePlayers) do
-			enforceValveAutoDisconnect(pState)
+		profBegin("ValveCheck")
+		for i = 1, numActive do
+			enforceValveAutoDisconnect(activePlayers[i])
 			if sessionState.valveDisconnectTriggered then
-				Profiler.End("ValveCheck")
-				Profiler.End("CreateMove_Total")
+				profEnd("ValveCheck")
+				profEnd("CreateMove_Total")
 				return
 			end
 		end
-		Profiler.End("ValveCheck")
+		profEnd("ValveCheck")
 	end
 
-	if enableSilent then
-		Profiler.Begin("SilentAim")
-		for _, pState in ipairs(activePlayers) do
+	if enableSilent or enableAimLock then
+		profBegin("SilentAim")
+		for i = 1, numActive do
+			local pState = activePlayers[i]
 			-- Only process players with pending shots from damage events
-			if SilentAim.HasPendingWork(pState) then
+			if enableSilent and SilentAim.HasPendingWork(pState) then
 				SilentAim.ProcessPlayer(pState)
 			end
 			-- Only process aimlock for players with recent victims
@@ -482,63 +491,68 @@ local function OnCreateMove(cmd)
 				AimLock.ProcessPlayer(pState)
 			end
 		end
-		Profiler.End("SilentAim")
+		profEnd("SilentAim")
 	end
 
 	if enableAntiAim then
-		Profiler.Begin("AntiAim")
-		for _, pState in ipairs(activePlayers) do
+		profBegin("AntiAim")
+		for i = 1, numActive do
+			local pState = activePlayers[i]
 			-- Only check players that need anti-aim detection
 			if AntiAim.HasWork(pState) then
 				AntiAim.ProcessPlayer(pState, cmd)
 			end
 		end
-		Profiler.End("AntiAim")
+		profEnd("AntiAim")
 	end
 
 	if enableDuckSpeed then
-		Profiler.Begin("DuckSpeed")
-		for _, pState in ipairs(activePlayers) do
+		profBegin("DuckSpeed")
+		for i = 1, numActive do
+			local pState = activePlayers[i]
 			if DuckSpeed.HasWork(pState) then
 				DuckSpeed.ProcessPlayer(pState)
 			end
 		end
-		Profiler.End("DuckSpeed")
+		profEnd("DuckSpeed")
 	end
 
 	if enableBhop then
-		Profiler.Begin("Bhop")
-		for _, pState in ipairs(activePlayers) do
+		profBegin("Bhop")
+		for i = 1, numActive do
+			local pState = activePlayers[i]
 			if Bhop.HasWork(pState) then
 				Bhop.ProcessPlayer(pState)
 			end
 		end
-		Profiler.End("Bhop")
+		profEnd("Bhop")
 	end
 
 	if enableDoubleTap then
-		Profiler.Begin("DoubleTap")
+		profBegin("DoubleTap")
 		DoubleTap.BeginDetectionTick(activePlayers, curTick)
-		for _, pState in ipairs(activePlayers) do
+		for i = 1, numActive do
+			local pState = activePlayers[i]
 			if DoubleTap.HasWork(pState) then
 				DoubleTap.ProcessPlayer(pState)
 			end
 		end
-		Profiler.End("DoubleTap")
+		profEnd("DoubleTap")
 	end
 
 	if enableChoke then
-		Profiler.Begin("FakeLag")
+		profBegin("FakeLag")
 		FakeLag.BeginDetectionTick(curTick)
-		for _, pState in ipairs(activePlayers) do
+		for i = 1, numActive do
+			local pState = activePlayers[i]
 			if FakeLag.HasWork(pState) then
 				FakeLag.ProcessPlayer(pState)
 			end
 		end
-		Profiler.End("FakeLag")
+		profEnd("FakeLag")
 	end
 
-	Profiler.End("CreateMove_Total")
+	profEnd("CreateMove_Total")
 end
 
 local function OnDraw()
@@ -606,7 +620,7 @@ end
 local function OnUnload()
 	print("[CD] Unloading system...")
 	engine.PlaySound("hl1/fvox/deactivated.wav")
-	-- Save config synchronously â€” fast io.open write, acceptable stutter on unload.
+	-- Save config synchronously — fast io.open write, acceptable stutter on unload.
 	if G.Menu then
 		Config.CreateCFG(G.Menu)
 	end
