@@ -14,19 +14,25 @@ local Evidence        = require("Cheater_Detection.Core.Evidence_system")
 local Events          = require("Cheater_Detection.Core.Events")
 local PlayerCache     = require("Cheater_Detection.Core.player_cache")
 local Common          = require("Cheater_Detection.Utils.Common")
-local Fetcher          = require("Cheater_Detection.Database.Fetcher")
-local HistoryManager   = require("Cheater_Detection.Utils.HistoryManager")
-local DetectionConfig  = require("Cheater_Detection.Utils.DetectionConfig")
+local Fetcher         = require("Cheater_Detection.Database.Fetcher")
+local HistoryManager  = require("Cheater_Detection.Utils.HistoryManager")
+local DetectionConfig = require("Cheater_Detection.Utils.DetectionConfig")
+
+local mathFloor       = math.floor
+local mathMin         = math.min
+local mathMax         = math.max
+local mathAbs         = math.abs
+local stringFormat    = string.format
 
 local DoubleTap = {}
 
 local SIMULTANEOUS_BURST_SUPPRESS_THRESHOLD = 3
 
-local BURST_MIN_TICKS_66HZ         = 24.0
+local BURST_MIN_TICKS_66HZ           = 24.0
 local FAKELAG_MAX_CHOKE_TICKS_66HZ   = 21.0
-local BURST_MAX_TICKS_66HZ         = 34.0
-local BURST_REPEAT_TOLERANCE       = 8
-local DT_CONFIRM_WINDOW_TICKS_66HZ = 48.0
+local BURST_MAX_TICKS_66HZ           = 34.0
+local BURST_REPEAT_TOLERANCE         = 8
+local DT_CONFIRM_WINDOW_TICKS_66HZ   = 48.0
 local FAKE_LAG_SUPPRESS_TICKS_66HZ   = 66.0
 
 -- Flat ~30 per correlated burst (one "usage"). Cap 300 ≈ 10 usages before cheater threshold.
@@ -48,7 +54,7 @@ local DT_FOCUS_PRIORITY_ROUTINE   = 0 -- under cap, background scan
 
 local cachedTickInterval  = nil
 local cachedBurstMinTicks = nil
-local cachedBurstMaxTicks  = nil
+local cachedBurstMaxTicks = nil
 local cachedConfirmTicks  = nil
 
 local playerState         = {}
@@ -56,6 +62,12 @@ local dtSuppressUntil     = {}
 local burstThisTick       = {}
 local lastBurstCleanTick  = 0
 local lastServerHitchTick = -math.huge
+
+-- Reusable pools for BeginDetectionTick to avoid per-tick GC allocations
+local _hotPool            = {}
+local _warmPool           = {}
+local _coldPool           = {}
+local _tiedPool           = {}
 
 -- One burst-scan ProcessPlayer per game tick; hot suspects preempt the round-robin pool.
 local focusTick           = -1
@@ -66,17 +78,23 @@ local coldRoundRobinIndex = 0
 local hurtBurstScanTick   = -1
 local hurtBurstScansUsed  = 0
 
+local function clearArray(t)
+	for i = 1, #t do
+		t[i] = nil
+	end
+end
+
 local function getBurstThresholds()
 	local tickInt = globals.TickInterval()
 	if tickInt ~= cachedTickInterval then
 		cachedTickInterval = tickInt
-		cachedBurstMinTicks = math.floor(BURST_MIN_TICKS_66HZ / 66.0 / tickInt + 0.5)
-		cachedBurstMaxTicks = math.floor(BURST_MAX_TICKS_66HZ / 66.0 / tickInt + 0.5)
-		cachedConfirmTicks = math.floor(DT_CONFIRM_WINDOW_TICKS_66HZ / 66.0 / tickInt + 0.5)
+		cachedBurstMinTicks = mathFloor(BURST_MIN_TICKS_66HZ / 66.0 / tickInt + 0.5)
+		cachedBurstMaxTicks = mathFloor(BURST_MAX_TICKS_66HZ / 66.0 / tickInt + 0.5)
+		cachedConfirmTicks = mathFloor(DT_CONFIRM_WINDOW_TICKS_66HZ / 66.0 / tickInt + 0.5)
 		if cachedBurstMinTicks <= 0 or cachedBurstMaxTicks <= cachedBurstMinTicks then
-			cachedBurstMinTicks = math.floor(BURST_MIN_TICKS_66HZ)
-			cachedBurstMaxTicks = math.floor(BURST_MAX_TICKS_66HZ)
-			cachedConfirmTicks = math.floor(DT_CONFIRM_WINDOW_TICKS_66HZ)
+			cachedBurstMinTicks = mathFloor(BURST_MIN_TICKS_66HZ)
+			cachedBurstMaxTicks = mathFloor(BURST_MAX_TICKS_66HZ)
+			cachedConfirmTicks = mathFloor(DT_CONFIRM_WINDOW_TICKS_66HZ)
 		end
 	end
 	return cachedBurstMinTicks, cachedBurstMaxTicks
@@ -88,7 +106,7 @@ local function getConfirmWindowTicks()
 end
 
 local function getFakeLagSuppressTicks()
-	return math.floor(FAKE_LAG_SUPPRESS_TICKS_66HZ / 66.0 / globals.TickInterval() + 0.5)
+	return mathFloor(FAKE_LAG_SUPPRESS_TICKS_66HZ / 66.0 / globals.TickInterval() + 0.5)
 end
 
 function DoubleTap.GetDtBurstMinTicks()
@@ -97,11 +115,11 @@ function DoubleTap.GetDtBurstMinTicks()
 end
 
 function DoubleTap.GetFakeLagMaxChokeTicks()
-	return math.floor(FAKELAG_MAX_CHOKE_TICKS_66HZ / 66.0 / globals.TickInterval() + 0.5)
+	return mathFloor(FAKELAG_MAX_CHOKE_TICKS_66HZ / 66.0 / globals.TickInterval() + 0.5)
 end
 
 function DoubleTap.GetFakeLagMinChokeTicks()
-	return math.max(8, math.floor(8.0 / 66.0 / globals.TickInterval() + 0.5))
+	return mathMax(8, mathFloor(8.0 / 66.0 / globals.TickInterval() + 0.5))
 end
 
 function DoubleTap.IsDtSizedBurst(tickDelta)
@@ -143,23 +161,23 @@ end
 function DoubleTap.GetDebugStats()
 	local scan = getDtScanLimits()
 	return {
-		enabled             = Common.IsDoubleTapDetectionEnabled(),
-		fetchBlocking       = Fetcher.State.isRunning == true,
-		connectionBlock     = Common.GetConnectionStabilityBlockReason(),
-		localListenBypass   = Common.IsDebugEnabled() and Common.IsLocalListenServer(),
-		model               = "simtime burst <-> hitscan hurt (48t bidirectional)",
-		simtimeRetention    = scan.retentionTicks,
-		dtRecentScanDeltas  = scan.dtRecent,
+		enabled              = Common.IsDoubleTapDetectionEnabled(),
+		fetchBlocking        = Fetcher.State.isRunning == true,
+		connectionBlock      = Common.GetConnectionStabilityBlockReason(),
+		localListenBypass    = Common.IsDebugEnabled() and Common.IsLocalListenServer(),
+		model                = "simtime burst <-> hitscan hurt (48t bidirectional)",
+		simtimeRetention     = scan.retentionTicks,
+		dtRecentScanDeltas   = scan.dtRecent,
 		dtWatchingScanDeltas = scan.dtWatching,
 	}
 end
 
 local function timeToTicks(time)
-	return math.floor(0.5 + time / globals.TickInterval())
+	return mathFloor(0.5 + time / globals.TickInterval())
 end
 
 local function getServerHitchWindow()
-	return math.floor(1.0 / globals.TickInterval() + 0.5)
+	return mathFloor(1.0 / globals.TickInterval() + 0.5)
 end
 
 local function isInHitchWindow(curTick)
@@ -196,6 +214,7 @@ local function getState(id)
 			lastDamageTick        = 0,
 			lastBurstTick         = 0,
 			lastBurstAmount       = 0,
+			lastBurstOriginTick   = -999,
 			lastBurstEvidenceTime = 0,
 			lastBurstSignature    = nil,
 			lastRejectTag         = nil,
@@ -218,7 +237,7 @@ end
 
 local function formatDeltaPreview(deltaTicks, limit)
 	local parts = {}
-	local n = math.min(limit or 6, #deltaTicks)
+	local n = mathMin(limit or 6, #deltaTicks)
 	for i = 1, n do
 		parts[#parts + 1] = tostring(deltaTicks[i])
 	end
@@ -241,7 +260,7 @@ local function logDtReject(id, tag, detail, throttle)
 		data.lastRejectTag = tag
 		data.lastRejectLogTime = now
 	end
-	print(string.format("[DoubleTap] %s reject [%s]: %s", id, tag, detail))
+	print(stringFormat("[DoubleTap] %s reject [%s]: %s", id, tag, detail))
 end
 
 local function isWatchingForBurst(id)
@@ -323,19 +342,19 @@ local function pickHotPoolFocus(pool, rrIndex)
 			bestDamageTick = damageTick
 		end
 	end
-	local tied = {}
+	clearArray(_tiedPool)
 	for i = 1, #pool do
 		if getState(pool[i]).lastDamageTick == bestDamageTick then
-			tied[#tied + 1] = pool[i]
+			_tiedPool[#_tiedPool + 1] = pool[i]
 		end
 	end
-	if #tied == 0 then
+	if #_tiedPool == 0 then
 		return pickRoundRobinId(pool, rrIndex)
 	end
-	if #tied == 1 then
-		return tied[1], rrIndex
+	if #_tiedPool == 1 then
+		return _tiedPool[1], rrIndex
 	end
-	return pickRoundRobinId(tied, rrIndex)
+	return pickRoundRobinId(_tiedPool, rrIndex)
 end
 
 local function resetHurtBurstScanBudget(curTick)
@@ -357,31 +376,32 @@ function DoubleTap.BeginDetectionTick(activePlayers, curTick)
 		return
 	end
 
-	local hotPool, warmPool, coldPool = {}, {}, {}
+	clearArray(_hotPool)
+	clearArray(_warmPool)
+	clearArray(_coldPool)
+
 	for i = 1, #activePlayers do
 		local pState = activePlayers[i]
 		local id = pState and pState.id
-		if not id then
-			goto continue
+		if id then
+			local priority = getDtFocusPriority(id, pState.pdata)
+			if priority == DT_FOCUS_PRIORITY_WATCH or priority == DT_FOCUS_PRIORITY_BURST then
+				_hotPool[#_hotPool + 1] = id
+			elseif priority == DT_FOCUS_PRIORITY_SUSPECT then
+				_warmPool[#_warmPool + 1] = id
+			elseif priority == DT_FOCUS_PRIORITY_ROUTINE then
+				_coldPool[#_coldPool + 1] = id
+			end
 		end
-		local priority = getDtFocusPriority(id, pState.pdata)
-		if priority == DT_FOCUS_PRIORITY_WATCH or priority == DT_FOCUS_PRIORITY_BURST then
-			hotPool[#hotPool + 1] = id
-		elseif priority == DT_FOCUS_PRIORITY_SUSPECT then
-			warmPool[#warmPool + 1] = id
-		elseif priority == DT_FOCUS_PRIORITY_ROUTINE then
-			coldPool[#coldPool + 1] = id
-		end
-		::continue::
 	end
 
 	local chosenId
-	if #hotPool > 0 then
-		chosenId, hotRoundRobinIndex = pickHotPoolFocus(hotPool, hotRoundRobinIndex)
-	elseif #warmPool > 0 then
-		chosenId, warmRoundRobinIndex = pickRoundRobinId(warmPool, warmRoundRobinIndex)
-	elseif #coldPool > 0 then
-		chosenId, coldRoundRobinIndex = pickRoundRobinId(coldPool, coldRoundRobinIndex)
+	if #_hotPool > 0 then
+		chosenId, hotRoundRobinIndex = pickHotPoolFocus(_hotPool, hotRoundRobinIndex)
+	elseif #_warmPool > 0 then
+		chosenId, warmRoundRobinIndex = pickRoundRobinId(_warmPool, warmRoundRobinIndex)
+	elseif #_coldPool > 0 then
+		chosenId, coldRoundRobinIndex = pickRoundRobinId(_coldPool, coldRoundRobinIndex)
 	end
 
 	focusedPlayerId = chosenId
@@ -402,25 +422,20 @@ local function clearStaleBurstState(data, curTick)
 	if (curTick - data.lastBurstTick) > confirmWindow then
 		data.lastBurstTick = 0
 		data.lastBurstAmount = 0
+		data.lastBurstSignature = nil
 	end
 end
 
 local function addCappedDtEvidence(id, wantedWeight)
-	local cap = Evidence.GetMethodScoreCap("double_tap")
-	if cap <= 0 then
-		cap = Evidence.GetMethodScoreCap("warp_dt")
-	end
-	local current = Evidence.GetMethodWeight(id, "double_tap")
-	if current <= 0 then
-		current = Evidence.GetMethodWeight(id, "warp_dt")
-	end
+	local cap = getDtEvidenceCap()
+	local current = getDtEvidenceWeight(id)
 	local remaining = cap - current
 	if remaining <= 0 then
-		logDtReject(id, "evidence_cap", string.format(
+		logDtReject(id, "evidence_cap", stringFormat(
 			"at cap (current=%.1f cap=%.1f wanted=%.1f)", current, cap, wantedWeight))
 		return 0
 	end
-	local actual = math.min(wantedWeight, remaining)
+	local actual = mathMin(wantedWeight, remaining)
 	Evidence.AddEvidence(id, "double_tap", actual)
 	return actual
 end
@@ -436,7 +451,7 @@ local function tryCreditDtCorrelation(id, burstAmount, burstTick, damageTick, re
 	elseif delayAfterBurst >= 0 and delayAfterBurst <= confirmWindow then
 		elapsed = delayAfterBurst
 	else
-		logDtReject(id, "timing", string.format(
+		logDtReject(id, "timing", stringFormat(
 			"%s burst=%d dmgTick=%d burstTick=%d dmg→burst=%d burst→dmg=%d window=%d",
 			reason, burstAmount, damageTick, burstTick, delayAfterBurst, delayAfterDmg, confirmWindow))
 		return 0
@@ -445,25 +460,25 @@ local function tryCreditDtCorrelation(id, burstAmount, burstTick, damageTick, re
 	local now = globals.RealTime()
 	local cooldownLeft = DT_EVIDENCE_COOLDOWN_S - (now - data.lastBurstEvidenceTime)
 	if cooldownLeft > 0 then
-		logDtReject(id, "cooldown", string.format(
+		logDtReject(id, "cooldown", stringFormat(
 			"%s burst=%d delay=%d wait=%.2fs", reason, burstAmount, elapsed, cooldownLeft))
 		return 0
 	end
 
 	-- No 5× mult on tight timing — that let 2 bursts ≈ suspicious (56+140). One usage ≈ 30.
-	local delayFactor = 1.0 - DT_LATE_DELAY_PENALTY_MAX * (elapsed / math.max(1, confirmWindow))
+	local delayFactor = 1.0 - DT_LATE_DELAY_PENALTY_MAX * (elapsed / mathMax(1, confirmWindow))
 	local weight = DT_EVIDENCE_WEIGHT * delayFactor
 
 	data.lastBurstEvidenceTime = now
 	local added = addCappedDtEvidence(id, weight)
 	if added > 0 then
 		if isDtLogEnabled() or Common.IsDebugEnabled() then
-			print(string.format(
+			print(stringFormat(
 				"[DoubleTap] %s %s (burst=%d ticks, delay=%d) -> evidence +%.1f",
 				id, reason, burstAmount, elapsed, added))
 		end
 	elseif weight > 0 then
-		logDtReject(id, "evidence_add", string.format(
+		logDtReject(id, "evidence_add", stringFormat(
 			"%s wanted=%.1f but AddEvidence returned 0", reason, weight))
 	end
 	return added
@@ -472,7 +487,7 @@ end
 local function countSimilarBursts(deltaTicks, burstAmount)
 	local similarCount = -1
 	for i = 1, #deltaTicks do
-		if math.abs(deltaTicks[i] - burstAmount) <= BURST_REPEAT_TOLERANCE then
+		if mathAbs(deltaTicks[i] - burstAmount) <= BURST_REPEAT_TOLERANCE then
 			similarCount = similarCount + 1
 		end
 	end
@@ -489,7 +504,7 @@ local function findRecentDtBurst(id, scanDepthOverride, quietOnMiss)
 	local history = HistoryManager.GetPlayerHistory(id)
 	if not history or history._count < 2 then
 		if not quietOnMiss then
-			logBurstScanFailure(id, "no_history", string.format(
+			logBurstScanFailure(id, "no_history", stringFormat(
 				"history missing or count=%s", history and tostring(history._count) or "nil"))
 		end
 		return 0, 1, nil, 0
@@ -504,13 +519,13 @@ local function findRecentDtBurst(id, scanDepthOverride, quietOnMiss)
 	local deltaTicks, deltaCount = HistoryManager.GetSimDeltaDeltas(history, scanDepth)
 	if deltaCount < 1 then
 		if not quietOnMiss then
-			logBurstScanFailure(id, "no_deltas", string.format(
+			logBurstScanFailure(id, "no_deltas", stringFormat(
 				"history count=%d but no simtime gaps", history._count))
 		end
 		return 0, 1, deltaTicks, 0
 	end
 
-	local scanLimit = math.min(scanDepth, deltaCount)
+	local scanLimit = mathMin(scanDepth, deltaCount)
 	local sawDtBand = false
 	local rhythmBlocked = nil
 	local maxInScan = 0
@@ -528,7 +543,7 @@ local function findRecentDtBurst(id, scanDepthOverride, quietOnMiss)
 				return burstAmount, index, deltaTicks, deltaCount
 			end
 			if not rhythmBlocked then
-				rhythmBlocked = string.format(
+				rhythmBlocked = stringFormat(
 					"idx=%d burst=%d similar=%d (>=2 in history)",
 					index, burstAmount, similar + 1)
 			end
@@ -539,7 +554,7 @@ local function findRecentDtBurst(id, scanDepthOverride, quietOnMiss)
 		if rhythmBlocked then
 			logBurstScanFailure(id, "rhythm", rhythmBlocked .. " | deltas=" .. formatDeltaPreview(deltaTicks, 8))
 		else
-			logBurstScanFailure(id, "no_dt_band", string.format(
+			logBurstScanFailure(id, "no_dt_band", stringFormat(
 				"scan=%d band=[%d,%d) sawDtBand=%s maxInScan=%d deltas=%s",
 				scanLimit, burstMin, burstMax, tostring(sawDtBand), maxInScan, formatDeltaPreview(deltaTicks, 8)))
 		end
@@ -550,11 +565,12 @@ end
 
 local function onBurstDetected(id, burstAmount, curTick, burstIndex)
 	local data = getState(id)
-	local signature = burstAmount * 100 + (burstIndex or 1)
-	if data.lastBurstSignature == signature then
+	local originTick = curTick - (burstIndex or 1)
+	if data.lastBurstSignature == burstAmount and mathAbs(originTick - data.lastBurstOriginTick) <= 4 then
 		return
 	end
-	data.lastBurstSignature = signature
+	data.lastBurstSignature = burstAmount
+	data.lastBurstOriginTick = originTick
 
 	local burstTick = curTick
 	DoubleTap.MarkDtRelease(id)
@@ -569,7 +585,7 @@ local function onBurstDetected(id, burstAmount, curTick, burstIndex)
 			data.lastBurstTick = 0
 			data.lastBurstAmount = 0
 			if added <= 0 and isDtLogEnabled() then
-				logDtReject(id, "burst_after_dmg", string.format(
+				logDtReject(id, "burst_after_dmg", stringFormat(
 					"burst=%d dmgTick=%d burstTick=%d (see prior reject)",
 					burstAmount, damageTick, burstTick))
 			end
@@ -581,7 +597,7 @@ local function onBurstDetected(id, burstAmount, curTick, burstIndex)
 	data.lastBurstTick = burstTick
 	data.lastBurstAmount = burstAmount
 	if isDtLogEnabled() then
-		logDtReject(id, "burst_no_pending_dmg", string.format(
+		logDtReject(id, "burst_no_pending_dmg", stringFormat(
 			"burst=%d at tick=%d (waiting for hit)", burstAmount, burstTick), true)
 	end
 end
@@ -625,7 +641,7 @@ local function tryDetectBurstForPlayer(id, curTick, forceScan, pdata)
 	if isServerHitch(curTick) then
 		lastServerHitchTick = curTick
 		if isDtLogEnabled() then
-			print(string.format(
+			print(stringFormat(
 				"[DoubleTap] server hitch suppressed burst for %s (tick=%d)",
 				id, curTick))
 		end
@@ -737,7 +753,7 @@ Events.Subscribe("OnHitscanHit", function(hit)
 		data.lastBurstAmount = 0
 		data.lastBurstSignature = nil
 		if added <= 0 and isDtLogEnabled() then
-			logDtReject(attackerID, "dmg_after_burst", string.format(
+			logDtReject(attackerID, "dmg_after_burst", stringFormat(
 				"burst=%d burstTick=%d dmgTick=%d (see prior reject)",
 				burstAmount, burstTick, curTick))
 		end
@@ -751,7 +767,7 @@ Events.Subscribe("OnHitscanHit", function(hit)
 		local now = globals.RealTime()
 		if (now - data.lastHurtLogTime) >= HURT_LOG_INTERVAL_S then
 			data.lastHurtLogTime = now
-			print(string.format(
+			print(stringFormat(
 				"[DoubleTap] %s dealt dmg=%d — watching for burst within %d ticks",
 				attackerID, hit.damage, getConfirmWindowTicks()))
 		end
